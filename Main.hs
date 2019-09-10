@@ -8,6 +8,14 @@ import Control.Monad.State
 import Control.Monad.Identity
 import LLVM.Module
 import LLVM.Context
+import LLVM.AST.Type
+import LLVM.AST
+import LLVM.AST.Global
+import qualified LLVM.AST.Linkage as L
+import qualified LLVM.AST.Constant as C
+import Data.ByteString (ByteString, pack)
+import Data.String.Transform (toShortByteString)
+import qualified Data.Text as DT
 import qualified LLVM.AST as AST
 
 type BfError = String
@@ -21,6 +29,27 @@ data Token = RGT -- (>) increment memory pointer
            | LOL -- ([) jump to next block, if current cell == 0
            | LOR -- (]) jump to previous block, if current cell != 0
            deriving Show
+
+--------------------------------------------------------
+-- CONSTANTS
+--------------------------------------------------------
+
+memSize :: Integer
+memSize = 65536
+
+memPos :: Integer
+memPos = floor $ (realToFrac memSize) / 2
+
+--------------------------------------------------------
+-- UTIL
+--------------------------------------------------------
+
+unnl :: String -> String
+unnl s = DT.unpack $ DT.replace (DT.pack "\\n") (DT.pack ['\n']) (DT.pack s)
+
+bsToS s = unnl $ show s
+
+sToBs s = toShortByteString s
 
 --------------------------------------------------------
 -- TOKENIZER
@@ -42,6 +71,13 @@ tokenize (s:ss) =
 
 
 --------------------------------------------------------
+-- LLVM TYPES
+--------------------------------------------------------
+
+memTy :: Type
+memTy = ArrayType (fromInteger memSize) i8
+
+--------------------------------------------------------
 -- LLVM CODEGEN
 --------------------------------------------------------
 
@@ -58,13 +94,52 @@ codegen :: [Token] -> IO AST.Module
 codegen ts = withContext $ \context ->
   withModuleFromAST context ast $ \m -> do
     llstr <- moduleLLVMAssembly m
-    print llstr
+    putStrLn $ bsToS llstr
     return ast
   where mod = codegenTop ts
         ast = runLLVM mod
 
 codegenTop :: [Token] -> LLVM ()
-codegenTop = \s -> return ()
+codegenTop ts = do
+  defVar "MEM" memTy $ Just $ C.AggregateZero memTy
+  defVar "MEM_POS" i32 $ Just $ C.Int 32 memPos
+  addDef $ TypeDefinition (Name "FILE") $ Nothing
+  defExternal "fflush" i32 [(NamedTypeReference (Name "FILE"), Name "")]
+  defExternal "putchar" i32 [(i8, Name "")]
+  defExternal "getchar" i32 []
+  defMain []
+
+addDef :: Definition -> LLVM ()
+addDef d = do
+  defs <- gets moduleDefinitions
+  modify $ \s -> s { moduleDefinitions = defs ++ [d] }
+
+defMain :: [BasicBlock] -> LLVM ()
+defMain body = addDef $
+  GlobalDefinition $ functionDefaults
+  { name = Name "main"
+  , parameters = ([], False)
+  , returnType = i32
+  , basicBlocks = body
+  }
+
+defExternal :: String -> Type -> [(Type, Name)] -> LLVM ()
+defExternal n t args = addDef $
+  GlobalDefinition $ functionDefaults
+  { name = Name $ sToBs n
+  , linkage = L.External
+  , parameters = ([Parameter ty nm [] | (ty, nm) <- args], False)
+  , returnType = t
+  , basicBlocks = []
+  }
+
+defVar :: String -> Type -> Maybe C.Constant -> LLVM ()
+defVar n t i = addDef $
+  GlobalDefinition $ globalVariableDefaults
+  { name = Name $ sToBs n
+  , LLVM.AST.Global.type' = t
+  , initializer = i
+  }
 
 --------------------------------------------------------
 -- MAIN ROUTINE
