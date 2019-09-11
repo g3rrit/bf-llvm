@@ -13,6 +13,11 @@ import LLVM.AST
 import LLVM.AST.Global
 import qualified LLVM.AST.Linkage as L
 import qualified LLVM.AST.Constant as C
+import qualified LLVM.AST.AddrSpace as AS
+import qualified LLVM.AST.IntegerPredicate as IP
+import qualified LLVM.AST.Attribute as A
+import qualified LLVM.AST.CallingConvention as CC
+import qualified LLVM.AST.Typed as T
 import Data.ByteString (ByteString, pack)
 import Data.String.Transform (toShortByteString)
 import qualified Data.Text as DT
@@ -77,6 +82,9 @@ tokenize (s:ss) =
 memTy :: Type
 memTy = ArrayType (fromInteger memSize) i8
 
+ptrTy :: Type -> Type
+ptrTy t = PointerType t $ AS.AddrSpace 0
+
 --------------------------------------------------------
 -- LLVM CODEGEN
 --------------------------------------------------------
@@ -107,7 +115,7 @@ codegenTop ts = do
   defExternal "fflush" i32 [(NamedTypeReference (Name "FILE"), Name "")]
   defExternal "putchar" i32 [(i8, Name "")]
   defExternal "getchar" i32 []
-  defMain []
+  defMain $ bbCodegen ts
 
 addDef :: Definition -> LLVM ()
 addDef d = do
@@ -140,6 +148,190 @@ defVar n t i = addDef $
   , LLVM.AST.Global.type' = t
   , initializer = i
   }
+
+--------------------------------------------------------
+-- BASIC BLOCK CODEGEN
+--------------------------------------------------------
+
+data BlockState = BlockState
+  { idx   :: Int -- block id
+  , label :: Name
+  , ins   :: [Named Instruction]
+  , ter   :: Maybe (Named Terminator)
+  }
+
+data CodegenState = CodegenState
+  { id     :: Int  -- current block id
+  , count  :: Word -- instruction count
+  , blocks :: [BlockState]
+  }
+
+newtype Codegen a = Codegen { runCodegen :: State CodegenState a }
+  deriving (Functor, Applicative, Monad, MonadState CodegenState)
+
+blocksToBb :: [BlockState] -> [BasicBlock]
+blocksToBb bs = map (\(BlockState _ l i (Just t)) -> BasicBlock l i t) bs
+
+execCodegen :: Codegen a -> CodegenState
+execCodegen m = execState (runCodegen m) $ CodegenState 0 0 [BlockState 0 (Name "entry") [] Nothing]
+
+bbCodegen :: [Token] -> [BasicBlock]
+bbCodegen ts = blocksToBb $ blocks $ execCodegen $ mapM transToken ts
+
+transToken :: Token -> Codegen ()
+transToken t = case t of
+                 RGT -> rgt
+                 LFT -> rgt
+                 INC -> rgt
+                 DEC -> rgt
+                 PRT -> rgt
+                 GET -> rgt
+                 LOL -> rgt
+                 LOR -> rgt
+
+rgt :: Codegen ()
+rgt = do
+  m0 <- load memPtr
+  m1 <- add m0 c1i32
+  store memPtr m1
+
+lft :: Codegen ()
+lft = do
+  m0 <- load memPtr
+  m1 <- sub m0 c1i32
+  store memPtr m1
+  ret
+
+
+inc :: Codegen ()
+inc = do
+  undefined
+
+dec :: Codegen ()
+dec = do
+  undefined
+
+prt :: Codegen ()
+prt = do
+  undefined
+
+get :: Codegen ()
+get = do
+  undefined
+
+lol :: Codegen ()
+lol = do
+  undefined
+
+lor :: Codegen ()
+lor = do
+  undefined
+
+modifyBlock :: (BlockState -> BlockState) -> Codegen ()
+modifyBlock f = modify (\(CodegenState i c (b:bs)) ->
+                          CodegenState i c ((f b):bs))
+
+addIns :: Instruction -> Codegen Name
+addIns ins = do
+  c' <- gets count
+  let ref = UnName c'
+  let ni = ref := ins
+  modify (\(CodegenState i c ((BlockState x l is t):bs))
+           -> CodegenState i (c + 1) ((BlockState x l (is ++ [ni]) t):bs))
+  return ref
+
+addStm :: Instruction -> Codegen ()
+addStm ins = do
+   modify (\(CodegenState i c ((BlockState x l is t):bs))
+           -> CodegenState i c ((BlockState x l (is ++ [Do ins]) t):bs))
+
+addTerm :: Terminator -> Codegen ()
+addTerm t = modifyBlock (\(BlockState x l is _) ->
+                           BlockState x l is (Just $ Do t))
+
+current :: Codegen BlockState
+current = head <$> (gets blocks)
+
+--------------------------------------------------------
+-- OPERANDS
+--------------------------------------------------------
+
+memPtr :: Operand
+memPtr = ConstantOperand $ C.GlobalReference (ptrTy i32) $ Name "MEM_POS"
+
+mem :: Operand
+mem = ConstantOperand $ C.GlobalReference memTy $ Name "MEM"
+
+c1i8 :: Operand
+c1i8 = ConstantOperand $ C.Int 8 1
+
+c1i32 :: Operand
+c1i32 = ConstantOperand $ C.Int 32 1
+
+--------------------------------------------------------
+-- INSTRUCTIONS
+--------------------------------------------------------
+
+lref :: Operand -> Name -> Operand
+lref o n = LocalReference (T.typeOf o) n
+
+ret :: Codegen ()
+ret = addTerm $ Ret Nothing []
+
+cbr :: Operand -> Name -> Name -> Codegen ()
+cbr cond tl fl = addTerm $ CondBr cond tl fl []
+
+load :: Operand -> Codegen Operand
+load ptr = (LocalReference t) <$> (addIns $ Load False ptr Nothing 0 [])
+  where (PointerType t _) = T.typeOf ptr
+
+store :: Operand -> Operand -> Codegen ()
+store add val = addStm $ Store False add val Nothing 0 []
+
+add :: Operand -> Operand -> Codegen Operand
+add v0 v1 = (lref v0) <$> (addIns $ Add False False v0 v1 [])
+
+sub :: Operand -> Operand -> Codegen Operand
+sub v0 v1 = (lref v0) <$> (addIns $ Sub False False v0 v1 [])
+
+getElementPtr :: Operand -> Operand -> Codegen Operand
+getElementPtr add ind = (lref add) <$> (addIns $ GetElementPtr False add [ConstantOperand $ C.Int 32 0, ind] [])
+
+trunc :: Operand -> Type -> Codegen Operand
+trunc val ty = (LocalReference ty) <$> (addIns $ Trunc val ty [])
+
+icmp :: Operand -> Operand -> Codegen Operand
+icmp v0 v1 = (LocalReference i1) <$> (addIns $ ICmp (IP.EQ) v0 v1 [])
+
+toArgs :: [Operand] -> [(Operand, [A.ParameterAttribute])]
+toArgs = map (\x -> (x, []))
+
+call :: Operand -> [Operand] -> Codegen Operand
+call fn args = (lref fn) <$> (addIns $ Call Nothing CC.C [] (Right fn) (toArgs args) [] [])
+
+
+
+
+-- incI32 :: Codegen ()
+-- incI32 = do
+--   c <- gets count
+--   addIns $ Add False False (LocalReference i32 $ UnName (c - 1)) (ConstantOperand $ C.Int 32 1)  []
+
+-- decI32 :: Codegen ()
+-- decI32 = do
+--   c <- gets count
+--   addIns $ Sub False False (LocalReference i32 $ UnName (c - 1)) (ConstantOperand $ C.Int 32 1)  []
+
+-- incI8 :: Codegen ()
+-- incI8 = do
+--   c <- gets count
+--   addIns $ Add False False (LocalReference i8 $ UnName (c - 1)) (ConstantOperand $ C.Int 8 1)  []
+
+-- decI8 :: Codegen ()
+-- decI8 = do
+--   c <- gets count
+--   addIns $ Sub False False (LocalReference i8 $ UnName (c - 1)) (ConstantOperand $ C.Int 8 1)  []
+
 
 --------------------------------------------------------
 -- MAIN ROUTINE
