@@ -33,8 +33,8 @@ data Token = RGT -- (>) increment memory pointer
            | DEC -- (-) decrement current cell
            | PRT -- (.) print value of current cell
            | GET -- (,) read value into current cell
-           | LOR -- ([) jump to next block, if current cell == 0
-           | LOL -- (]) jump to previous block, if current cell != 0
+           | LOL -- ([) jump to next block, if current cell == 0
+           | LOR -- (]) jump to previous block, if current cell != 0
            deriving Show
 
 --------------------------------------------------------
@@ -42,7 +42,7 @@ data Token = RGT -- (>) increment memory pointer
 --------------------------------------------------------
 
 memSize :: Integer
-memSize = 65536
+memSize = 1048576
 
 memPos :: Integer
 memPos = floor $ (realToFrac memSize) / 2
@@ -163,8 +163,9 @@ data BlockState = BlockState
   }
 
 data CodegenState = CodegenState
-  { bid    :: Int  -- current block id
-  , count  :: Word -- instruction count
+  { bid    :: Int   -- id count
+  , lstack :: [Int] -- block id stack
+  , count  :: Word  -- instruction count
   , blocks :: [BlockState]
   }
 
@@ -172,10 +173,10 @@ newtype Codegen a = Codegen { runCodegen :: State CodegenState a }
   deriving (Functor, Applicative, Monad, MonadState CodegenState)
 
 blocksToBb :: [BlockState] -> [BasicBlock]
-blocksToBb bs = map (\(BlockState _ l i (Just t)) -> BasicBlock l i t) bs
+blocksToBb bs = reverse $ map (\(BlockState _ l i (Just t)) -> BasicBlock l i t) bs
 
 execCodegen :: Codegen a -> CodegenState
-execCodegen m = execState (runCodegen m) $ CodegenState 0 0 [BlockState 0 (Name "entry") [] Nothing]
+execCodegen m = execState (runCodegen m) $ CodegenState 0 [] 0 [BlockState 0 (Name "entry") [] Nothing]
 
 bbCodegen :: [Token] -> [BasicBlock]
 bbCodegen ts = blocksToBb $ blocks $ execCodegen $ (mapM transToken ts) >> ret
@@ -188,20 +189,20 @@ transToken t = case t of
                  DEC -> dec
                  PRT -> prt
                  GET -> gte
-                 LOR -> lor
                  LOL -> lol
+                 LOR -> lor
 
 rgt :: Codegen ()
 rgt = do
   m0 <- load memPtr
   m1 <- add m0 c1i32
-  store memPtr m1
+  store m1 memPtr
 
 lft :: Codegen ()
 lft = do
   m0 <- load memPtr
   m1 <- sub m0 c1i32
-  store memPtr m1
+  store m1 memPtr
 
 inc :: Codegen ()
 inc = do
@@ -236,19 +237,18 @@ gte = do
   m3 <- getElementPtr mem m2
   store m1 m3
 
+lol :: Codegen ()
+lol = do
+  pushBid
+  loop
+  i <- getBid
+  pushBlock $ BlockState i (Name $ sToBs $ "l." ++ (show i)) [] Nothing
+
 lor :: Codegen ()
 lor = do
   loop
-  modifyBlockId (+ 1)
-  i <- gets bid
-  pushBlock $ BlockState i (Name $ sToBs $ "l" ++ (show $ i - 1)) [] Nothing
-
-lol :: Codegen ()
-lol = do
-  modifyBlockId (\x -> x - 1)
-  loop
-  i <- gets bid
-  pushBlock $ BlockState i (Name $ sToBs $ "r" ++ (show $ i - 1)) [] Nothing
+  i <- popBid
+  pushBlock $ BlockState i (Name $ sToBs $ "r." ++ (show i)) [] Nothing
 
 loop :: Codegen ()
 loop = do
@@ -256,35 +256,50 @@ loop = do
   m1 <- getElementPtr mem m0
   m2 <- load m1
   m3 <- icmp m2 c0i8
-  i <- gets bid
-  cbr m3 (Name "entry") (Name "entry")
-  -- cbr m3 (Name $ sToBs $ "r." ++ (show i)) (Name $ sToBs $ "l." ++ (show i))
+  i <- getBid
+  cbr m3 (Name $ sToBs $ "r." ++ (show i)) (Name $ sToBs $ "l." ++ (show i))
 
 pushBlock :: BlockState -> Codegen ()
-pushBlock b = modify (\(CodegenState i c bs) ->
-                          CodegenState i c (b:bs))
+pushBlock b = modify (\(CodegenState i is c bs) ->
+                          CodegenState i is c (b:bs))
 
 modifyBlock :: (BlockState -> BlockState) -> Codegen ()
-modifyBlock f = modify (\(CodegenState i c (b:bs)) ->
-                          CodegenState i c ((f b):bs))
+modifyBlock f = modify (\(CodegenState i is c (b:bs)) ->
+                          CodegenState i is c ((f b):bs))
 
-modifyBlockId :: (Int -> Int) -> Codegen ()
-modifyBlockId f = modify (\(CodegenState i c bs) ->
-                            CodegenState (f i) c bs)
+addBid :: Codegen ()
+addBid = modify (\(CodegenState i is c bs) ->
+                            CodegenState (i + 1) is c bs)
+
+getBid :: Codegen Int
+getBid = do
+  is <- gets lstack
+  return $ head is
+
+pushBid :: Codegen ()
+pushBid = modify (\(CodegenState i is c bs) ->
+                     CodegenState (i + 1) (i:is) c bs)
+
+popBid :: Codegen Int
+popBid = do
+  i <- getBid
+  modify (\(CodegenState i' (i:is) c bs) ->
+             CodegenState i' is c bs)
+  return i
 
 addIns :: Instruction -> Codegen Name
 addIns ins = do
   c' <- gets count
   let ref = UnName c'
   let ni = ref := ins
-  modify (\(CodegenState i c ((BlockState x l is t):bs))
-           -> CodegenState i (c + 1) ((BlockState x l (is ++ [ni]) t):bs))
+  modify (\(CodegenState i is' c ((BlockState x l is t):bs))
+           -> CodegenState i is' (c + 1) ((BlockState x l (is ++ [ni]) t):bs))
   return ref
 
 addStm :: Instruction -> Codegen ()
 addStm ins = do
-   modify (\(CodegenState i c ((BlockState x l is t):bs))
-           -> CodegenState i c ((BlockState x l (is ++ [Do ins]) t):bs))
+   modify (\(CodegenState i is' c ((BlockState x l is t):bs))
+           -> CodegenState i is' c ((BlockState x l (is ++ [Do ins]) t):bs))
 
 addTerm :: Terminator -> Codegen ()
 addTerm t = modifyBlock (\(BlockState x l is _) ->
@@ -312,6 +327,9 @@ c1i32 = ConstantOperand $ C.Int 32 1
 c0i8 :: Operand
 c0i8 = ConstantOperand $ C.Int 8 0
 
+c0i32 :: Operand
+c0i32 = ConstantOperand $ C.Int 32 0
+
 fnPutchar :: Operand
 fnPutchar = ConstantOperand $ C.GlobalReference (ptrTy $ FunctionType i32 [i8] False) $ Name "putchar"
 
@@ -329,7 +347,7 @@ lref :: Operand -> Name -> Operand
 lref o n = LocalReference (T.typeOf o) n
 
 ret :: Codegen ()
-ret = addTerm $ Ret Nothing []
+ret = addTerm $ Ret (Just c0i32) []
 
 cbr :: Operand -> Name -> Name -> Codegen ()
 cbr cond tl fl = addTerm $ CondBr cond tl fl []
