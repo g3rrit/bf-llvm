@@ -391,10 +391,8 @@ main = do
   let path = head args
   putStrLn $ "File: " ++ path
   content <- readFile path
-  putStrLn $ "Content: " ++ content
-  putStrLn $ "Token: "
   let ts = tokenize content
-  print ts
-
-  codegen ts
-  return ()
+  ast <- codegen ts
+  withContext $ \context ->
+    withModuleFromAST context ast $ \m ->
+    writeLLVMAssemblyToFile (File $ path ++ ".ll") m
